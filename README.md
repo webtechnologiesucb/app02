@@ -42,6 +42,25 @@ Dependencias: `Api → Application + Infrastructure`, `Infrastructure → Applic
 
 ---
 
+## Desarrollo local paso a paso
+
+De cero a API corriendo en desarrollo (Windows + LocalDB):
+
+1. **Crear la base de datos** (ver [Puesta en marcha de la base de datos](#puesta-en-marcha-de-la-base-de-datos)):
+   `CREATE DATABASE Northwind` y carga de `instnwnd.sql` con `sqlcmd`.
+2. **Configurar la cadena de conexión** con User Secrets (ver
+   [Configuración de la cadena de conexión](#configuración-de-la-cadena-de-conexión)).
+3. **Ejecutar la API**: `dotnet run --project src/NorthwindApi.Api` y abrir
+   `http://localhost:5297/swagger` y `http://localhost:5297/health`.
+4. **Verificar con pruebas**: `dotnet test` (unitarias en memoria + integración
+   contra la base real; ver [Pruebas](#pruebas)).
+5. **Extender**: para un nuevo recurso CRUD siga
+   [Cómo agregar un nuevo recurso CRUD](#cómo-agregar-un-nuevo-recurso-crud); si cambió
+   el esquema, regenere el contexto según
+   [EF Core database-first (re-scaffolding)](#ef-core-database-first-re-scaffolding).
+
+---
+
 ## Puesta en marcha de la base de datos
 
 El script de origen es `instnwnd.sql` (raíz del repositorio). Con **sqlcmd**:
@@ -94,6 +113,19 @@ dotnet run --project src/NorthwindApi.Api
 | Dashboard    | `http://localhost:5297/`         |
 | Swagger UI   | `http://localhost:5297/swagger`  |
 | Salud        | `http://localhost:5297/health`   |
+
+### Comandos de ejecución
+
+| Comando                                            | Descripción                                          |
+| -------------------------------------------------- | ---------------------------------------------------- |
+| `dotnet restore`                                   | Restaura los paquetes NuGet de la solución           |
+| `dotnet build NorthwindApi.slnx`                   | Compila toda la solución (0 errores / 0 advertencias)|
+| `dotnet build -c Release NorthwindApi.slnx`        | Compila en configuración Release                     |
+| `dotnet run --project src/NorthwindApi.Api`        | Arranca la API en desarrollo (`:5297`)               |
+| `dotnet watch --project src/NorthwindApi.Api run`  | Recompila y reinicia al detectar cambios             |
+| `dotnet test`                                      | Ejecuta la suite de pruebas (unitarias + integración)|
+| `dotnet clean`                                     | Limpia los artefactos de compilación                 |
+| `dotnet publish src/NorthwindApi.Api -c Release`   | Genera artefactos listos para despliegue             |
 
 ---
 
