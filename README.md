@@ -1,6 +1,6 @@
 # NorthwindApi
 
-[![CI](https://github.com/webtechnologiesucb/app02/actions/workflows/ci.yml/badge.svg)](https://github.com/webtechnologiesucb/app02/actions/workflows/ci.yml)
+[![CI/CD](https://github.com/webtechnologiesucb/app02/actions/workflows/ci-cd-pipeline.yml/badge.svg)](https://github.com/webtechnologiesucb/app02/actions/workflows/ci-cd-pipeline.yml)
 
 API REST sobre la base de datos **Northwind** (SQL Server), construida con **ASP.NET Core (.NET 10)**
 y **Entity Framework Core (database-first)**. Expone:
@@ -20,8 +20,13 @@ y **Entity Framework Core (database-first)**. Expone:
 NorthwindApi.slnx
 instnwnd.sql                              Script de creación/datos de Northwind
 Dockerfile                                Imagen de la API (multi-stage, Kestrel)
-docker-compose.yml                        SQL Server 2022 + init de BD + API
+docker-compose.yml                        SQL Server 2022 + init de BD + API (desarrollo)
 .dockerignore / .env.example              Contexto de build y plantilla de variables
+deploy/
+  docker-compose.prod.yml                 Orquestación de producción (consume la imagen de GHCR)
+  deploy.sh                               Script de despliegue (SSH): pull, up, /health, rollback
+scripts/init-northwind.sh                 Carga de la base Northwind (CI y local)
+docs/database-analysis.md                 Análisis del esquema y los datos
 src/
   NorthwindApi.Api/                       Capa web (controllers, middleware, Swagger, dashboard)
   NorthwindApi.Application/               DTOs, modelos, abstracciones, utilidades comunes
@@ -337,16 +342,149 @@ si no, LocalDB `(localdb)\MSSQLLocalDB` con la base `Northwind`.
 
 ---
 
-## Integración continua (GitHub Actions)
+## Pipeline CI/CD (GitHub Actions)
 
-El flujo [`.github/workflows/ci.yml`](.github/workflows/ci.yml) se ejecuta en `push`/`pull_request`
-a `main` y de forma manual, con dos trabajos:
+El flujo [`.github/workflows/ci-cd-pipeline.yml`](.github/workflows/ci-cd-pipeline.yml) cubre
+**integración continua y entrega continua** de la API. Se ejecuta en cada `push` a `main`,
+en cada `pull_request` hacia `main`, al publicar un tag `v*` y de forma manual desde
+**Actions → CI/CD Pipeline → Run workflow**.
 
-1. **Build y pruebas (.NET 10)** — restaura, compila en `Release`, levanta un contenedor de
-   **SQL Server 2022**, carga la base `Northwind` con `scripts/init-northwind.sh` y ejecuta
-   `dotnet test` (39 pruebas). Los resultados se suben como artefacto.
-2. **Imagen Docker** — construye la imagen con Buildx (caché de GitHub Actions) y, en `push` a
-   `main`, la publica en **GHCR** (`ghcr.io/<owner>/<repo>`).
+```
+push / pull_request / tag v*
+        │
+        ├──► build  ──► test ──► image (GHCR) ──► deploy (SSH + Docker Compose)
+```
+
+| # | Job | Descripción |
+|---|-----|-------------|
+| 1 | **build** | Restaura paquetes, compila la solución en `Release` (`dotnet build NorthwindApi.slnx`) y ejecuta `dotnet publish` de la API; sube el resultado como artefacto `api-publish`. |
+| 2 | **test** | Levanta **SQL Server 2022** como servicio del runner, crea y carga la base `Northwind` con `scripts/init-northwind.sh` y ejecuta `dotnet test` (unitarias + integración) con cobertura (`XPlat Code Coverage`). Publica el `.trx` y el informe de cobertura como artefacto `test-results` y resume la cobertura en la ejecución. |
+| 3 | **image** | Construye la imagen con **Buildx** (caché de GitHub Actions) y la publica en **GHCR** (`ghcr.io/<owner>/<repo>`) con las etiquetas `latest` (rama por defecto), `<rama>`, `<sha-corto>` y las derivadas de un tag `v*` (`v1.2.3`, `1.2`). En los *pull requests* la imagen **se construye pero no se publica**, para validar el `Dockerfile` sin gastar permisos de publicación. |
+| 4 | **deploy** | Se conecta por **SSH** al servidor, descarga la imagen de GHCR y levanta el stack con `docker compose`; verifica `/health` y **revierte automáticamente** a la imagen anterior si la comprobación falla. |
+
+### Cuándo se despliega
+
+| Evento | `build` | `test` | `image` | `deploy` |
+|--------|---------|--------|---------|----------|
+| `push` a `main` | ✅ | ✅ | ✅ publica | ✅ |
+| `push` de tag `v*` | ✅ | ✅ | ✅ publica | ✅ |
+| `pull_request` a `main` | ✅ | ✅ | ⚙️ sólo construye | ❌ |
+| `workflow_dispatch` | ✅ | ✅ | ✅ publica | ✅ sólo si `deploy = true` |
+
+El job `deploy` usa un **environment** de GitHub (`production` por defecto, `staging` elegible
+desde la entrada manual), lo que permite exigir aprobación manual, restrictores de
+despliegue y secretos propios de cada entorno.
+
+### Secretos y variables
+
+Configurar en **Settings → Secrets and variables → Actions** (repositorio) o en el
+*environment* correspondiente:
+
+| Nombre | Tipo | Descripción |
+|--------|------|-------------|
+| `DEPLOY_HOST` | Variable | Dirección IP o nombre del servidor de despliegue. |
+| `DEPLOY_USER` | Variable | Usuario SSH con permisos de escritura (p. ej. `deploy`). |
+| `DEPLOY_PATH` | Variable | Ruta del despliegue en el servidor (por defecto `/opt/northwind-api`). |
+| `API_PORT` | Variable | Puerto HTTP publicado por la API (por defecto `8080`). |
+| `DEPLOY_URL` | Variable | URL pública de la API; se muestra como enlace del *environment*. |
+| `HEALTH_RETRIES` | Variable (opcional) | Intentos de espera (SQL Server saludable y `/health`) tras desplegar (por defecto `30`). |
+| `HEALTH_INTERVAL` | Variable (opcional) | Segundos entre intentos de verificación (por defecto `5`). |
+| `DEPLOY_SSH_KEY` | Secreto | Clave **privada** SSH del usuario de despliegue (formato OpenSSH). |
+| `DEPLOY_SSH_KNOWN_HOSTS` | Secreto | Salida de `ssh-keyscan -H <host>` (evita conexiones a hosts desconocidos). |
+| `MSSQL_SA_PASSWORD` | Secreto | Contraseña del usuario `sa` de SQL Server. |
+| `DEPLOY_GHCR_USERNAME` | Secreto (opcional) | Usuario de GHCR si el paquete es privado. |
+| `DEPLOY_GHCR_TOKEN` | Secreto (opcional) | Token de PAT de GHCR (`read:packages`) si el paquete es privado. |
+
+> `GITHUB_TOKEN` se usa automáticamente para publicar la imagen en GHCR (permiso
+> `packages: write`); no hay que crear ningún secreto adicional para el registro.
+
+### Requisitos del servidor
+
+- Linux con **Docker Engine** y el plugin **Compose v2** (`docker compose version`).
+- Un usuario SSH con permisos de escritura sobre `DEPLOY_PATH` y con acceso a Docker
+  (grupo `docker`).
+- `curl` o `wget` instalado (si no, el sondeo de salud se hace con un contenedor efímero
+  `curlimages/curl`).
+- Salida a Internet para descargar la imagen de GHCR.
+
+### Pasos para desplegar
+
+**A. Preparación del servidor (una sola vez)**
+
+1. Crear el usuario de despliegue y autorizar la clave pública:
+
+   ```bash
+   sudo adduser --disabled-password --gecos "" deploy
+   sudo usermod -aG docker deploy          # acceso al socket de Docker
+   sudo install -d -o deploy -g deploy /opt/northwind-api
+   sudo -u deploy mkdir -p ~/.ssh
+   sudo -u deploy bash -c 'cat >> ~/.ssh/authorized_keys' <<< "CLAVE_PUBLICA"
+   sudo chmod 700 ~/.ssh && sudo chmod 600 ~/.ssh/authorized_keys
+   ```
+
+2. Generar el par de claves (en el equipo, no en el servidor) y registrar la **privada**
+   como secreto `DEPLOY_SSH_KEY`:
+
+   ```bash
+   ssh-keygen -t ed25519 -C "northwind-deploy" -f ~/.ssh/northwind_deploy
+   ssh-keyscan -H <servidor>        # -> contenido del secreto DEPLOY_SSH_KNOWN_HOSTS
+   ```
+
+3. Registrar en GitHub los secretos y variables de la tabla anterior.
+
+4. Publicar el paquete de GHCR como público, o bien crear
+   `DEPLOY_GHCR_USERNAME` / `DEPLOY_GHCR_TOKEN` para que el servidor se autentique.
+
+**B. Lanzar el primer despliegue**
+
+1. En **Actions → CI/CD Pipeline → Run workflow**, marcar **`deploy = true`** y elegir el
+   entorno (`production`).
+2. El pipeline ejecuta `build → test → image → deploy`.
+3. En el servidor, `deploy/deploy.sh` comprueba si la base `Northwind` existe: si no,
+   ejecuta `db-init` una sola vez (perfil `init`) y carga `instnwnd.sql`.
+4. Verificación final:
+
+   ```bash
+   curl -fsS http://<servidor>:8080/health
+   # {"status":"Healthy","database":"Northwind"}
+   ```
+
+**C. Despliegues posteriores**
+
+Cada `push` a `main` (o cada tag `v*`) vuelve a ejecutar el pipeline completo y actualiza
+el servidor con la imagen recién publicada. El flujo en el servidor es siempre el mismo:
+
+```
+ssh → docker login (si es privado) → docker compose pull api
+     → docker compose up -d sqlserver  → espera "healthy"
+     → db-init (sólo si la BD está vacía)
+     → docker compose up -d api        → /health  →  ok  |  reversión
+```
+
+**D. Verificación y reversión manual**
+
+```bash
+# Estado de los contenedores
+cd /opt/northwind-api && docker compose -f docker-compose.prod.yml ps
+
+# Última imagen desplegada
+cat /opt/northwind-api/last-image
+
+# Volver a una versión anterior
+export API_IMAGE=ghcr.io/webtechnologiesucb/app02:<etiqueta-anterior>
+export MSSQL_SA_PASSWORD='...'
+docker compose -f docker-compose.prod.yml up -d api
+```
+
+### Ejecución local equivalente (sin pipeline)
+
+```bash
+dotnet restore NorthwindApi.slnx
+dotnet build NorthwindApi.slnx --configuration Release
+bash scripts/init-northwind.sh          # requiere Docker + SQL Server accesible
+dotnet test NorthwindApi.slnx --configuration Release
+docker build -t ghcr.io/webtechnologiesucb/app02:local .
+```
 
 El script `scripts/init-northwind.sh` es reutilizable en local: crea la base (si no existe) y
 carga `instnwnd.sql` ejecutando `sqlcmd` dentro de un contenedor efímero de SQL Server.
@@ -425,6 +563,12 @@ docker compose down -v            # detener y borrar los datos
   exponer Swagger UI y el panel. Cámbielo a `Production` para ocultarlos.
 - **Reinicio de la carga de datos** — para volver a ejecutar `db-init`:
   `docker compose run --rm db-init` (tras `docker compose down`).
+
+> Este `docker-compose.yml` es el de **desarrollo**: construye la imagen localmente
+> (`--build`). El despliegue a un servidor lo hace el pipeline de GitHub Actions con
+> [`deploy/docker-compose.prod.yml`](deploy/docker-compose.prod.yml), que **consume la imagen
+> ya publicada en GHCR** en lugar de construirla. Véase
+> [Pipeline CI/CD (GitHub Actions)](#pipeline-cicd-github-actions).
 
 ---
 

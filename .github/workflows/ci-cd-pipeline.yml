@@ -1,0 +1,317 @@
+name: CI/CD Pipeline
+
+# Pipeline completo de la API NorthwindApi (.NET 10 / ASP.NET Core):
+#   build -> test -> image (GHCR) -> deploy (SSH + Docker Compose)
+#
+# La etapa de despliegue solo se ejecuta para pushes a `main`, para tags `v*`
+# o de forma manual desde "Actions" (workflow_dispatch) con la entrada "deploy".
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: 'Desplegar la imagen en el servidor'
+        type: boolean
+        default: false
+      environment:
+        description: 'Entorno de destino'
+        type: choice
+        options:
+          - production
+          - staging
+        default: production
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "true"
+  DOTNET_VERSION: "10.0.x"
+  SOLUTION: "NorthwindApi.slnx"
+  API_PROJECT: "src/NorthwindApi.Api/NorthwindApi.Api.csproj"
+  REGISTRY: "ghcr.io"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) Compilación de la solución en Release
+  # ---------------------------------------------------------------------------
+  build:
+    name: Compilación (.NET 10)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+          cache: true
+          cache-dependency-path: '**/*.csproj'
+
+      - name: Restaurar paquetes NuGet
+        run: dotnet restore "${{ env.SOLUTION }}"
+
+      - name: Compilar (Release)
+        run: dotnet build "${{ env.SOLUTION }}" --configuration Release --no-restore
+
+      - name: Publicar la API (Release)
+        run: >
+          dotnet publish "${{ env.API_PROJECT }}"
+          --configuration Release
+          --output artifacts/publish
+          --no-self-contained
+          -p:UseAppHost=false
+
+      - name: Subir el artefacto de publicación
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-publish
+          path: artifacts/publish
+          retention-days: 7
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 2) Pruebas unitarias y de integración (SQL Server 2022 como servicio)
+  # ---------------------------------------------------------------------------
+  test:
+    name: Pruebas (.NET 10 + SQL Server 2022)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_PID: "Developer"
+          MSSQL_SA_PASSWORD: "Your_password123"
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P Your_password123 -Q 'SELECT 1' -b"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 30
+          --health-start-period 40s
+
+    env:
+      NORTHWIND_TEST_CONNECTION: "Server=localhost,1433;Database=Northwind;User Id=sa;Password=Your_password123;TrustServerCertificate=True;MultipleActiveResultSets=True"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+          cache: true
+          cache-dependency-path: '**/*.csproj'
+
+      - name: Restaurar paquetes NuGet
+        run: dotnet restore "${{ env.SOLUTION }}"
+
+      - name: Compilar (Release)
+        run: dotnet build "${{ env.SOLUTION }}" --configuration Release --no-restore
+
+      - name: Cargar la base de datos Northwind
+        env:
+          SERVER: localhost
+          SA_PASSWORD: "Your_password123"
+        run: bash scripts/init-northwind.sh
+
+      - name: Ejecutar pruebas
+        run: >
+          dotnet test "${{ env.SOLUTION }}"
+          --no-build --configuration Release
+          --collect:"XPlat Code Coverage"
+          --logger "trx;LogFileName=results.trx"
+          --results-directory TestResults
+
+      - name: Resumen de cobertura
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import glob, os, xml.etree.ElementTree as ET
+          files = glob.glob("TestResults/**/coverage.cobertura.xml", recursive=True)
+          lines = ["### Cobertura de las pruebas", ""]
+          if files:
+              root = ET.parse(files[0]).getroot()
+              rate = float(root.get("line-rate", 0)) * 100
+              lines.append(f"- Cobertura de lineas: **{rate:.2f}%**")
+          else:
+              lines.append("- No se genero el informe de cobertura.")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write("\n".join(lines) + "\n")
+          PY
+
+      - name: Subir resultados de las pruebas
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: TestResults
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # 3) Imagen Docker publicada en GHCR
+  # ---------------------------------------------------------------------------
+  image:
+    name: Imagen Docker (GHCR)
+    needs: [ build, test ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.tag.outputs.image }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Iniciar sesión en GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Metadatos de la imagen
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Determinar la imagen a desplegar
+        id: tag
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            tag="${{ github.ref_name }}"
+          else
+            tag="latest"
+          fi
+          echo "image=${{ env.REGISTRY }}/${{ github.repository }}:${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Construir la imagen
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # 4) Despliegue en el servidor (SSH + Docker Compose)
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Despliegue (${{ github.event.inputs.environment || 'production' }})
+    needs: image
+    if: >-
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))) ||
+      (github.event_name == 'workflow_dispatch' && inputs.deploy == true)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: ${{ github.event.inputs.environment || 'production' }}
+      url: ${{ vars.DEPLOY_URL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Preparar la clave SSH
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          if [ -n "$DEPLOY_SSH_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$DEPLOY_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          fi
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Preparar el archivo de entorno del despliegue
+        env:
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          API_PORT: ${{ vars.API_PORT }}
+          HEALTH_RETRIES: ${{ vars.HEALTH_RETRIES }}
+          HEALTH_INTERVAL: ${{ vars.HEALTH_INTERVAL }}
+          API_IMAGE: ${{ needs.image.outputs.image }}
+          MSSQL_SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
+          GHCR_USERNAME: ${{ secrets.DEPLOY_GHCR_USERNAME }}
+          GHCR_TOKEN: ${{ secrets.DEPLOY_GHCR_TOKEN }}
+        run: |
+          set -euo pipefail
+          {
+            printf 'DEPLOY_PATH=%q\n' "${DEPLOY_PATH:-/opt/northwind-api}"
+            printf 'API_PORT=%q\n' "${API_PORT:-8080}"
+            printf 'HEALTH_RETRIES=%q\n' "${HEALTH_RETRIES:-30}"
+            printf 'HEALTH_INTERVAL=%q\n' "${HEALTH_INTERVAL:-5}"
+            printf 'API_IMAGE=%q\n' "$API_IMAGE"
+            printf 'MSSQL_SA_PASSWORD=%q\n' "$MSSQL_SA_PASSWORD"
+            printf 'GHCR_USERNAME=%q\n' "${GHCR_USERNAME:-}"
+            printf 'GHCR_TOKEN=%q\n' "${GHCR_TOKEN:-}"
+          } > northwind-deploy.env
+          chmod 600 northwind-deploy.env
+
+      - name: Copiar los archivos de despliegue
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+        run: |
+          set -euo pipefail
+          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+            deploy/docker-compose.prod.yml \
+            deploy/deploy.sh \
+            instnwnd.sql \
+            northwind-deploy.env \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:/tmp/"
+
+      - name: Desplegar y verificar
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "trap 'rm -f /tmp/northwind-deploy.env' EXIT; chmod +x /tmp/deploy.sh; bash /tmp/deploy.sh /tmp/northwind-deploy.env"
