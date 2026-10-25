@@ -3,8 +3,10 @@ name: CI/CD Pipeline
 # Pipeline completo de la API NorthwindApi (.NET 10 / ASP.NET Core):
 #   build -> test -> image (GHCR) -> sqlserver-image (GHCR) -> deploy (Koyeb)
 #
-# La etapa de despliegue solo se ejecuta para pushes a `main`, para tags `v*`
-# o de forma manual desde "Actions" (workflow_dispatch) con la entrada "deploy".
+# La etapa de despliegue solo se ejecuta de forma manual desde "Actions"
+# (workflow_dispatch) con la entrada "deploy" activada. Los pushes y tags solo
+# construyen y publican las imágenes; así no se crean recursos de pago en Koyeb
+# sin una confirmación explícita.
 
 on:
   push:
@@ -241,7 +243,7 @@ jobs:
   # ---------------------------------------------------------------------------
   # 4) Imagen de SQL Server con el cliente sqlcmd y el script de Northwind
   # ---------------------------------------------------------------------------
-  sqlserver-image:
+  sqlserver_image:
     name: Imagen SQL Server (GHCR)
     needs: [ build, test ]
     runs-on: ubuntu-latest
@@ -299,10 +301,8 @@ jobs:
   # ---------------------------------------------------------------------------
   deploy:
     name: Despliegue (${{ github.event.inputs.environment || 'production' }})
-    needs: [ image, sqlserver-image ]
-    if: >-
-      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))) ||
-      (github.event_name == 'workflow_dispatch' && inputs.deploy == true)
+    needs: [ image, sqlserver_image ]
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy == true
     runs-on: ubuntu-latest
     timeout-minutes: 60
     environment:
@@ -346,8 +346,8 @@ jobs:
               echo "::error title=Contraseña de ejemplo::MSSQL_SA_PASSWORD no puede ser la contraseña de ejemplo del repositorio."
               exit 1
               ;;
-            *';'*|*'"'*)
-              echo "::error title=Contraseña no válida::MSSQL_SA_PASSWORD no puede contener ';' ni comillas dobles (se usa en una cadena de conexión)."
+            *';'*|*'"'*|*"'"*)
+              echo "::error title=Contraseña no válida::MSSQL_SA_PASSWORD no puede contener ';' ni comillas (se usa en una cadena de conexión)."
               exit 1
               ;;
           esac
@@ -414,7 +414,7 @@ jobs:
       - name: Crear/actualizar el servicio SQL Server
         env:
           KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
-          SQLSERVER_IMAGE: ${{ needs.sqlserver-image.outputs.image }}
+          SQLSERVER_IMAGE: ${{ needs.sqlserver_image.outputs.image }}
           UPDATE_SQLSERVER: ${{ github.event.inputs.update_sqlserver || 'false' }}
         run: |
           set -euo pipefail
