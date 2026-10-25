@@ -359,7 +359,7 @@ push / pull_request / tag v*
 |---|-----|-------------|
 | 1 | **build** | Restaura paquetes, compila la solución en `Release` (`dotnet build NorthwindApi.slnx`) y ejecuta `dotnet publish` de la API; sube el resultado como artefacto `api-publish`. |
 | 2 | **test** | Levanta **SQL Server 2022** como servicio del runner, crea y carga la base `Northwind` con `scripts/init-northwind.sh` y ejecuta `dotnet test` (unitarias + integración) con cobertura (`XPlat Code Coverage`). Publica el `.trx` y el informe de cobertura como artefacto `test-results` y resume la cobertura en la ejecución. |
-| 3 | **image** | Construye la imagen con **Buildx** (caché de GitHub Actions) y la publica en **GHCR** (`ghcr.io/<owner>/<repo>`) con las etiquetas `latest` (rama por defecto), `<rama>`, `<sha-corto>` y las derivadas de un tag `v*` (`v1.2.3`, `1.2`). En los *pull requests* la imagen **se construye pero no se publica**, para validar el `Dockerfile` sin gastar permisos de publicación. |
+| 3 | **image** | Construye la imagen con **Buildx** (caché de GitHub Actions) y la publica en **GHCR** (`ghcr.io/<owner>/<repo>`) con las etiquetas `latest` (rama por defecto), `<rama>`, `<sha-corto>` (`sha-<7 caracteres>`) y las derivadas de un tag `v*` (`v1.2.3`, `1.2`). El despliegue usa la etiqueta inmutable `sha-<corto>` para poder revertir a la imagen anterior. En los *pull requests* la imagen **se construye pero no se publica**, para validar el `Dockerfile` sin gastar permisos de publicación. |
 | 4 | **deploy** | Se conecta por **SSH** al servidor, descarga la imagen de GHCR y levanta el stack con `docker compose`; verifica `/health` y **revierte automáticamente** a la imagen anterior si la comprobación falla. |
 
 ### Cuándo se despliega
@@ -386,6 +386,7 @@ Configurar en **Settings → Secrets and variables → Actions** (repositorio) o
 | `DEPLOY_USER` | Variable | Usuario SSH con permisos de escritura (p. ej. `deploy`). |
 | `DEPLOY_PATH` | Variable | Ruta del despliegue en el servidor (por defecto `/opt/northwind-api`). |
 | `API_PORT` | Variable | Puerto HTTP publicado por la API (por defecto `8080`). |
+| `SQL_PORT` | Variable (opcional) | Puerto publicado por SQL Server (por defecto `1433`). |
 | `DEPLOY_URL` | Variable | URL pública de la API; se muestra como enlace del *environment*. |
 | `HEALTH_RETRIES` | Variable (opcional) | Intentos de espera (SQL Server saludable y `/health`) tras desplegar (por defecto `30`). |
 | `HEALTH_INTERVAL` | Variable (opcional) | Segundos entre intentos de verificación (por defecto `5`). |
@@ -397,6 +398,23 @@ Configurar en **Settings → Secrets and variables → Actions** (repositorio) o
 
 > `GITHUB_TOKEN` se usa automáticamente para publicar la imagen en GHCR (permiso
 > `packages: write`); no hay que crear ningún secreto adicional para el registro.
+
+> El job `deploy` valida al inicio que `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_SSH_KEY` y
+> `MSSQL_SA_PASSWORD` estén definidos; si falta alguno, falla con un mensaje que indica
+> exactamente qué configurar y en qué environment. Configura estos valores en el
+> environment que usa el despliegue (`production` por defecto).
+
+Ejemplo de configuración desde **GitHub CLI** (ajusta los valores):
+
+```bash
+gh variable set DEPLOY_HOST --env production --body "203.0.113.10"
+gh variable set DEPLOY_USER --env production --body "deploy"
+gh variable set DEPLOY_URL  --env production --body "http://203.0.113.10:8080"
+gh secret set DEPLOY_SSH_KEY --env production < ~/.ssh/northwind_deploy
+ssh-keyscan -H 203.0.113.10 > /tmp/northwind_known_hosts
+gh secret set DEPLOY_SSH_KNOWN_HOSTS --env production < /tmp/northwind_known_hosts
+gh secret set MSSQL_SA_PASSWORD --env production
+```
 
 ### Requisitos del servidor
 

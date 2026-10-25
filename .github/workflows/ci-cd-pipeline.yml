@@ -217,7 +217,9 @@ jobs:
           if [ "${{ github.ref_type }}" = "tag" ]; then
             tag="${{ github.ref_name }}"
           else
-            tag="latest"
+            # Etiqueta inmutable por commit: permite comparar y revertir a la
+            # imagen anterior (con "latest" ambas referencias serían iguales).
+            tag="sha-${GITHUB_SHA::7}"
           fi
           echo "image=${{ env.REGISTRY }}/${{ github.repository }}:${tag}" >> "$GITHUB_OUTPUT"
 
@@ -251,6 +253,31 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Validar la configuración del despliegue
+        env:
+          ENVIRONMENT: ${{ github.event.inputs.environment || 'production' }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}
+          MSSQL_SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "$DEPLOY_HOST" ] || missing+=("DEPLOY_HOST (variable)")
+          [ -n "$DEPLOY_USER" ] || missing+=("DEPLOY_USER (variable)")
+          [ -n "$DEPLOY_SSH_KEY" ] || missing+=("DEPLOY_SSH_KEY (secreto)")
+          [ -n "$MSSQL_SA_PASSWORD" ] || missing+=("MSSQL_SA_PASSWORD (secreto)")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error title=Configuración de despliegue incompleta::Faltan en el environment '${ENVIRONMENT}': ${missing[*]}"
+            echo "Configúralos en Settings → Secrets and variables → Actions → Environments → ${ENVIRONMENT}."
+            exit 1
+          fi
+          if [ -z "$DEPLOY_SSH_KNOWN_HOSTS" ]; then
+            echo "::warning title=DEPLOY_SSH_KNOWN_HOSTS no configurado::Se intentará obtener la clave del host con ssh-keyscan."
+          fi
+          echo "Configuración de despliegue completa para el environment '${ENVIRONMENT}'."
+
       - name: Preparar la clave SSH
         env:
           DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
@@ -258,14 +285,17 @@ jobs:
           DEPLOY_SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
+          : "${DEPLOY_HOST:?Falta la variable DEPLOY_HOST}"
+          : "${DEPLOY_SSH_KEY:?Falta el secreto DEPLOY_SSH_KEY}"
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           if [ -n "$DEPLOY_SSH_KNOWN_HOSTS" ]; then
             printf '%s\n' "$DEPLOY_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          else
-            ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          elif ! ssh-keyscan -T 10 -H "$DEPLOY_HOST" > ~/.ssh/known_hosts 2>/dev/null || [ ! -s ~/.ssh/known_hosts ]; then
+            echo "::error title=No se pudo verificar el host SSH::Ejecuta 'ssh-keyscan -H ${DEPLOY_HOST}' y guarda el resultado en el secreto DEPLOY_SSH_KNOWN_HOSTS."
+            exit 1
           fi
           chmod 644 ~/.ssh/known_hosts
 
@@ -273,6 +303,7 @@ jobs:
         env:
           DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
           API_PORT: ${{ vars.API_PORT }}
+          SQL_PORT: ${{ vars.SQL_PORT }}
           HEALTH_RETRIES: ${{ vars.HEALTH_RETRIES }}
           HEALTH_INTERVAL: ${{ vars.HEALTH_INTERVAL }}
           API_IMAGE: ${{ needs.image.outputs.image }}
@@ -281,9 +312,12 @@ jobs:
           GHCR_TOKEN: ${{ secrets.DEPLOY_GHCR_TOKEN }}
         run: |
           set -euo pipefail
+          : "${API_IMAGE:?No se recibió la imagen a desplegar desde el job 'image'}"
+          : "${MSSQL_SA_PASSWORD:?Falta el secreto MSSQL_SA_PASSWORD}"
           {
             printf 'DEPLOY_PATH=%q\n' "${DEPLOY_PATH:-/opt/northwind-api}"
             printf 'API_PORT=%q\n' "${API_PORT:-8080}"
+            printf 'SQL_PORT=%q\n' "${SQL_PORT:-1433}"
             printf 'HEALTH_RETRIES=%q\n' "${HEALTH_RETRIES:-30}"
             printf 'HEALTH_INTERVAL=%q\n' "${HEALTH_INTERVAL:-5}"
             printf 'API_IMAGE=%q\n' "$API_IMAGE"
@@ -299,7 +333,8 @@ jobs:
           DEPLOY_USER: ${{ vars.DEPLOY_USER }}
         run: |
           set -euo pipefail
-          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+          # -p conserva el modo 600 de northwind-deploy.env (contiene secretos).
+          scp -p -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes -o BatchMode=yes \
             deploy/docker-compose.prod.yml \
             deploy/deploy.sh \
             instnwnd.sql \
@@ -312,6 +347,6 @@ jobs:
           DEPLOY_USER: ${{ vars.DEPLOY_USER }}
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes -o BatchMode=yes \
             "${DEPLOY_USER}@${DEPLOY_HOST}" \
             "trap 'rm -f /tmp/northwind-deploy.env' EXIT; chmod +x /tmp/deploy.sh; bash /tmp/deploy.sh /tmp/northwind-deploy.env"
