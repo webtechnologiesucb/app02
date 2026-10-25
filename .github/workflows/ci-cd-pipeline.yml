@@ -1,12 +1,7 @@
 name: CI/CD Pipeline
 
 # Pipeline completo de la API NorthwindApi (.NET 10 / ASP.NET Core):
-#   build -> test -> image (GHCR) -> sqlserver-image (GHCR) -> deploy (Koyeb)
-#
-# La etapa de despliegue solo se ejecuta de forma manual desde "Actions"
-# (workflow_dispatch) con la entrada "deploy" activada. Los pushes y tags solo
-# construyen y publican las imágenes; así no se crean recursos de pago en Koyeb
-# sin una confirmación explícita.
+#   build -> test -> image (GHCR) -> sqlserver-image (GHCR)
 
 on:
   push:
@@ -15,22 +10,6 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch:
-    inputs:
-      deploy:
-        description: 'Desplegar en Koyeb'
-        type: boolean
-        default: false
-      update_sqlserver:
-        description: 'Actualizar también la imagen de SQL Server (reinicia la BD)'
-        type: boolean
-        default: false
-      environment:
-        description: 'Entorno de destino'
-        type: choice
-        options:
-          - production
-          - staging
-        default: production
 
 concurrency:
   group: ci-cd-${{ github.ref }}
@@ -251,8 +230,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-    outputs:
-      image: ${{ steps.tag.outputs.image }}
 
     steps:
       - name: Checkout
@@ -269,16 +246,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Determinar la imagen de SQL Server
-        id: tag
-        run: |
-          set -euo pipefail
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            tag="sqlserver-${{ github.ref_name }}"
-          else
-            tag="sqlserver-sha-${GITHUB_SHA::7}"
-          fi
-          echo "image=${{ env.REGISTRY }}/${{ github.repository }}:${tag}" >> "$GITHUB_OUTPUT"
+      - name: Metadatos de la imagen de SQL Server
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            type=ref,event=branch,suffix=-sqlserver
+            type=ref,event=tag,suffix=-sqlserver
+            type=sha,format=short,suffix=-sqlserver
+            type=raw,value=sqlserver-latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}},suffix=-sqlserver
+            type=semver,pattern={{major}}.{{minor}},suffix=-sqlserver
 
       - name: Construir la imagen de SQL Server
         uses: docker/build-push-action@v7
@@ -286,218 +265,9 @@ jobs:
           context: .
           file: ./deploy/sqlserver/Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
-          # Se publica en el mismo paquete público de GHCR que la API.
-          tags: |
-            ${{ steps.tag.outputs.image }}
-            ${{ env.REGISTRY }}/${{ github.repository }}:sqlserver-latest
-          labels: |
-            org.opencontainers.image.title=Northwind SQL Server
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=sqlserver
           cache-to: type=gha,mode=max,scope=sqlserver
 
-  # ---------------------------------------------------------------------------
-  # 5) Despliegue en Koyeb (SQL Server privado + API pública)
-  # ---------------------------------------------------------------------------
-  deploy:
-    name: Despliegue (${{ github.event.inputs.environment || 'production' }})
-    needs: [ image, sqlserver_image ]
-    if: github.event_name == 'workflow_dispatch' && inputs.deploy == true
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    environment:
-      name: ${{ github.event.inputs.environment || 'production' }}
-      url: ${{ vars.DEPLOY_URL }}
 
-    env:
-      # Valores por defecto; se pueden sobreescribir con variables del environment.
-      KOYEB_APP: ${{ vars.KOYEB_APP || 'northwind' }}
-      KOYEB_REGION: ${{ vars.KOYEB_REGION || 'was' }}
-      KOYEB_SQLSERVER_SERVICE: ${{ vars.KOYEB_SQLSERVER_SERVICE || 'sqlserver' }}
-      KOYEB_API_SERVICE: ${{ vars.KOYEB_API_SERVICE || 'api' }}
-      KOYEB_VOLUME: ${{ vars.KOYEB_VOLUME || 'northwind-mssql' }}
-      KOYEB_SQLSERVER_INSTANCE: ${{ vars.KOYEB_SQLSERVER_INSTANCE || 'medium' }}
-      KOYEB_API_INSTANCE: ${{ vars.KOYEB_API_INSTANCE || 'eco-small' }}
-      KOYEB_MSSQL_PID: ${{ vars.KOYEB_MSSQL_PID || 'Express' }}
-      KOYEB_MSSQL_MEMORY_MB: ${{ vars.KOYEB_MSSQL_MEMORY_MB || '1536' }}
-
-    steps:
-      - name: Validar la configuración de Koyeb
-        env:
-          ENVIRONMENT: ${{ github.event.inputs.environment || 'production' }}
-          KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
-          MSSQL_SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
-        run: |
-          set -euo pipefail
-          missing=()
-          [ -n "$KOYEB_TOKEN" ] || missing+=("KOYEB_TOKEN (secreto)")
-          [ -n "$MSSQL_SA_PASSWORD" ] || missing+=("MSSQL_SA_PASSWORD (secreto)")
-          if [ "${#missing[@]}" -gt 0 ]; then
-            echo "::error title=Configuración de Koyeb incompleta::Faltan en el environment '${ENVIRONMENT}': ${missing[*]}"
-            echo "Configúralos en Settings → Secrets and variables → Actions → Environments → ${ENVIRONMENT}."
-            exit 1
-          fi
-          if [ "${#MSSQL_SA_PASSWORD}" -lt 12 ]; then
-            echo "::error title=Contraseña demasiado corta::MSSQL_SA_PASSWORD debe tener al menos 12 caracteres."
-            exit 1
-          fi
-          case "$MSSQL_SA_PASSWORD" in
-            Your_password123)
-              echo "::error title=Contraseña de ejemplo::MSSQL_SA_PASSWORD no puede ser la contraseña de ejemplo del repositorio."
-              exit 1
-              ;;
-            *';'*|*'"'*|*"'"*)
-              echo "::error title=Contraseña no válida::MSSQL_SA_PASSWORD no puede contener ';' ni comillas (se usa en una cadena de conexión)."
-              exit 1
-              ;;
-          esac
-          case "$KOYEB_REGION" in
-            was|fra) ;;
-            *)
-              echo "::error title=Región no válida::KOYEB_REGION debe ser 'was' o 'fra' para usar volúmenes persistentes."
-              exit 1
-              ;;
-          esac
-          echo "Configuración de Koyeb completa para el environment '${ENVIRONMENT}'."
-          echo "App=${KOYEB_APP}; región=${KOYEB_REGION}; SQL Server=${KOYEB_SQLSERVER_SERVICE} (${KOYEB_SQLSERVER_INSTANCE}); API=${KOYEB_API_SERVICE} (${KOYEB_API_INSTANCE})."
-
-      - name: Instalar Koyeb CLI
-        run: |
-          set -euo pipefail
-          curl -fsSL https://raw.githubusercontent.com/koyeb/koyeb-cli/master/install.sh | sh
-          echo "$HOME/.koyeb/bin" >> "$GITHUB_PATH"
-
-      - name: Verificar el token de Koyeb
-        env:
-          KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
-        run: |
-          set -euo pipefail
-          koyeb --token "$KOYEB_TOKEN" whoami
-
-      - name: Crear/actualizar los secretos en Koyeb
-        env:
-          KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
-          MSSQL_SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
-        run: |
-          set -euo pipefail
-          connection="Server=${KOYEB_SQLSERVER_SERVICE}.${KOYEB_APP}.internal,1433;Database=Northwind;User Id=sa;Password=${MSSQL_SA_PASSWORD};Encrypt=True;TrustServerCertificate=True;MultipleActiveResultSets=True"
-
-          upsert_secret() {
-            local name="$1"
-            local value="$2"
-            if koyeb --token "$KOYEB_TOKEN" secrets get "$name" >/dev/null 2>&1; then
-              printf '%s' "$value" | koyeb --token "$KOYEB_TOKEN" secrets update "$name" --value-from-stdin >/dev/null
-            else
-              printf '%s' "$value" | koyeb --token "$KOYEB_TOKEN" secrets create "$name" --value-from-stdin >/dev/null
-            fi
-          }
-
-          upsert_secret MSSQL_SA_PASSWORD "$MSSQL_SA_PASSWORD"
-          upsert_secret NORTHWIND_CONNECTION "$connection"
-          echo "Secretos de Koyeb listos."
-
-      - name: Crear la app y el volumen en Koyeb
-        env:
-          KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
-        run: |
-          set -euo pipefail
-          if ! koyeb --token "$KOYEB_TOKEN" apps get "$KOYEB_APP" >/dev/null 2>&1; then
-            koyeb --token "$KOYEB_TOKEN" apps create "$KOYEB_APP"
-          fi
-          if ! koyeb --token "$KOYEB_TOKEN" volumes get "$KOYEB_VOLUME" >/dev/null 2>&1; then
-            koyeb --token "$KOYEB_TOKEN" volumes create "$KOYEB_VOLUME" \
-              --region "$KOYEB_REGION" \
-              --size 10
-          fi
-          echo "App y volumen listos."
-
-      - name: Crear/actualizar el servicio SQL Server
-        env:
-          KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
-          SQLSERVER_IMAGE: ${{ needs.sqlserver_image.outputs.image }}
-          UPDATE_SQLSERVER: ${{ github.event.inputs.update_sqlserver || 'false' }}
-        run: |
-          set -euo pipefail
-          : "${SQLSERVER_IMAGE:?No se recibió la imagen de SQL Server desde el job 'sqlserver-image'}"
-          args=(
-            --app "$KOYEB_APP"
-            --docker "$SQLSERVER_IMAGE"
-            --instance-type "$KOYEB_SQLSERVER_INSTANCE"
-            --regions "$KOYEB_REGION"
-            --ports 1433:tcp
-            --checks 1433:tcp
-            --checks-grace-period 1433=180
-            --volumes "${KOYEB_VOLUME}:/var/opt/mssql"
-            --env ACCEPT_EULA=Y
-            --env "MSSQL_PID=${KOYEB_MSSQL_PID}"
-            --env 'MSSQL_SA_PASSWORD={{secret.MSSQL_SA_PASSWORD}}'
-            --env "MSSQL_MEMORY_LIMIT_MB=${KOYEB_MSSQL_MEMORY_MB}"
-            --deployment-strategy immediate
-            --min-scale 1
-            --max-scale 1
-            --wait
-            --wait-timeout 20m
-          )
-          if ! koyeb --token "$KOYEB_TOKEN" services get "$KOYEB_SQLSERVER_SERVICE" --app "$KOYEB_APP" >/dev/null 2>&1; then
-            koyeb --token "$KOYEB_TOKEN" services create "$KOYEB_SQLSERVER_SERVICE" "${args[@]}"
-          elif [ "$UPDATE_SQLSERVER" = "true" ]; then
-            koyeb --token "$KOYEB_TOKEN" services update "$KOYEB_SQLSERVER_SERVICE" "${args[@]}"
-          else
-            echo "SQL Server ya existe; se conserva la imagen actual (usa update_sqlserver=true para actualizarla)."
-          fi
-
-      - name: Inicializar la base de datos Northwind
-        env:
-          KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
-        run: |
-          set -euo pipefail
-          for attempt in $(seq 1 30); do
-            if koyeb --token "$KOYEB_TOKEN" services exec "$KOYEB_SQLSERVER_SERVICE" \
-              --app "$KOYEB_APP" bash -- /scripts/init-northwind.sh; then
-              exit 0
-            fi
-            echo "SQL Server aún no acepta la inicialización (intento ${attempt}/30); reintentando..."
-            sleep 10
-          done
-          echo "::error title=Inicialización de Northwind fallida::Revisa los logs del servicio SQL Server en Koyeb."
-          exit 1
-
-      - name: Crear/actualizar el servicio API
-        env:
-          KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
-          API_IMAGE: ${{ needs.image.outputs.image }}
-        run: |
-          set -euo pipefail
-          : "${API_IMAGE:?No se recibió la imagen de la API desde el job 'image'}"
-          args=(
-            --app "$KOYEB_APP"
-            --docker "$API_IMAGE"
-            --instance-type "$KOYEB_API_INSTANCE"
-            --regions "$KOYEB_REGION"
-            --ports 8080:http
-            --routes /:8080
-            --checks 8080:http:/health
-            --checks-grace-period 8080=120
-            --env ASPNETCORE_ENVIRONMENT=Production
-            --env ASPNETCORE_HTTP_PORTS=8080
-            --env 'ConnectionStrings__Northwind={{secret.NORTHWIND_CONNECTION}}'
-            --wait
-            --wait-timeout 20m
-          )
-          if ! koyeb --token "$KOYEB_TOKEN" services get "$KOYEB_API_SERVICE" --app "$KOYEB_APP" >/dev/null 2>&1; then
-            koyeb --token "$KOYEB_TOKEN" services create "$KOYEB_API_SERVICE" "${args[@]}"
-          else
-            koyeb --token "$KOYEB_TOKEN" services update "$KOYEB_API_SERVICE" "${args[@]}"
-          fi
-
-      - name: Resumen del despliegue
-        run: |
-          {
-            echo "### Despliegue en Koyeb completado"
-            echo ""
-            echo "- App: \`${KOYEB_APP}\`"
-            echo "- API: \`${KOYEB_API_SERVICE}\` (pública, health check \`/health\`)"
-            echo "- SQL Server: \`${KOYEB_SQLSERVER_SERVICE}\` (privado, volumen \`${KOYEB_VOLUME}\`)"
-            echo ""
-            echo "Consulta la URL pública en el panel de Koyeb y asígnala a la variable \`DEPLOY_URL\`."
-          } >> "$GITHUB_STEP_SUMMARY"
