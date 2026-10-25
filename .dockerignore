@@ -23,7 +23,7 @@ run.err.log
 # El script de datos no se copia a la imagen final de la API. Se incluye en el
 # contexto porque la imagen de SQL Server (deploy/sqlserver/Dockerfile) lo copia
 # a /scripts/instnwnd.sql para inicializar Northwind.
-!/instnwnd.sql
+!instnwnd.sql
 
 # Configuración de Docker (se pasa desde el host)
 Dockerfile
