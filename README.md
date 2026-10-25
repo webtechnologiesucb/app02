@@ -23,8 +23,9 @@ Dockerfile                                Imagen de la API (multi-stage, Kestrel
 docker-compose.yml                        SQL Server 2022 + init de BD + API (desarrollo)
 .dockerignore / .env.example              Contexto de build y plantilla de variables
 deploy/
-  docker-compose.prod.yml                 Orquestación de producción (consume la imagen de GHCR)
-  deploy.sh                               Script de despliegue (SSH): pull, up, /health, rollback
+  sqlserver/                              Imagen de SQL Server para Koyeb (volumen + init Northwind)
+  docker-compose.prod.yml                 Referencia legacy para VPS (no la usa el pipeline)
+  deploy.sh                               Referencia legacy de despliegue SSH (no la usa el pipeline)
 scripts/init-northwind.sh                 Carga de la base Northwind (CI y local)
 docs/database-analysis.md                 Análisis del esquema y los datos
 src/
@@ -342,170 +343,166 @@ si no, LocalDB `(localdb)\MSSQLLocalDB` con la base `Northwind`.
 
 ---
 
-## Pipeline CI/CD (GitHub Actions)
+## Pipeline CI/CD (GitHub Actions + Koyeb)
 
 El flujo [`.github/workflows/ci-cd-pipeline.yml`](.github/workflows/ci-cd-pipeline.yml) cubre
-**integración continua y entrega continua** de la API. Se ejecuta en cada `push` a `main`,
-en cada `pull_request` hacia `main`, al publicar un tag `v*` y de forma manual desde
-**Actions → CI/CD Pipeline → Run workflow**.
+**integración continua** en cada `push` a `main`, cada `pull_request` y cada tag `v*`. El
+**despliegue** se ejecuta únicamente de forma manual desde
+**Actions → CI/CD Pipeline → Run workflow**, con `deploy = true`.
 
 ```
 push / pull_request / tag v*
         │
-        ├──► build  ──► test ──► image (GHCR) ──► deploy (SSH + Docker Compose)
+        ├──► build ──► test ──► image (GHCR) ──┐
+        │                                      ├──► deploy (Koyeb, manual)
+        └──────────────► sqlserver-image (GHCR)┘
 ```
 
 | # | Job | Descripción |
 |---|-----|-------------|
-| 1 | **build** | Restaura paquetes, compila la solución en `Release` (`dotnet build NorthwindApi.slnx`) y ejecuta `dotnet publish` de la API; sube el resultado como artefacto `api-publish`. |
-| 2 | **test** | Levanta **SQL Server 2022** como servicio del runner, crea y carga la base `Northwind` con `scripts/init-northwind.sh` y ejecuta `dotnet test` (unitarias + integración) con cobertura (`XPlat Code Coverage`). Publica el `.trx` y el informe de cobertura como artefacto `test-results` y resume la cobertura en la ejecución. |
-| 3 | **image** | Construye la imagen con **Buildx** (caché de GitHub Actions) y la publica en **GHCR** (`ghcr.io/<owner>/<repo>`) con las etiquetas `latest` (rama por defecto), `<rama>`, `<sha-corto>` (`sha-<7 caracteres>`) y las derivadas de un tag `v*` (`v1.2.3`, `1.2`). El despliegue usa la etiqueta inmutable `sha-<corto>` para poder revertir a la imagen anterior. En los *pull requests* la imagen **se construye pero no se publica**, para validar el `Dockerfile` sin gastar permisos de publicación. |
-| 4 | **deploy** | Se conecta por **SSH** al servidor, descarga la imagen de GHCR y levanta el stack con `docker compose`; verifica `/health` y **revierte automáticamente** a la imagen anterior si la comprobación falla. |
+| 1 | **build** | Restaura paquetes, compila la solución en `Release` y publica la API; sube el artefacto `api-publish`. |
+| 2 | **test** | Levanta **SQL Server 2022** como servicio del runner, carga Northwind con `scripts/init-northwind.sh` y ejecuta `dotnet test` con cobertura. Publica `test-results`. |
+| 3 | **image** | Construye la imagen de la API con Buildx y la publica en **GHCR** (`ghcr.io/<owner>/<repo>`) con las etiquetas `latest`, `<rama>`, `sha-<7>` y las de un tag `v*`. |
+| 4 | **sqlserver-image** | Construye la imagen de SQL Server 2022 con `instnwnd.sql` y el script de inicialización; la publica en el **mismo paquete público de GHCR** con el tag `sqlserver-sha-<7>`. |
+| 5 | **deploy** | Crea o actualiza los recursos de **Koyeb**: app, volumen, secretos, servicio SQL Server privado y servicio API público. Inicializa Northwind y espera a que `/health` responda. |
+
+En los *pull requests* las imágenes **se construyen pero no se publican** y el despliegue no se
+ejecuta. La API usa la etiqueta inmutable `sha-<7>` para poder revertir a una versión anterior.
+
+### Arquitectura en Koyeb
+
+```
+Koyeb App: northwind (región was o fra)
+├── SQL Server 2022 (servicio web privado, standard medium)
+│   ├── puerto 1433/TCP, sin ruta pública
+│   ├── volumen persistente northwind-mssql (10 GB) en /var/opt/mssql
+│   └── secreto MSSQL_SA_PASSWORD
+└── API ASP.NET Core (servicio público, eco-small)
+    ├── puerto 8080/HTTP, ruta /, health check /health
+    └── ConnectionStrings__Northwind -> secreto NORTHWIND_CONNECTION
+        Server=sqlserver.northwind.internal,1433
+```
+
+Koyeb no ofrece SQL Server como base de datos gestionada: se ejecuta como un **servicio
+personalizado** con una imagen propia, un volumen persistente y escala fija en `1`. La API y
+SQL Server deben estar en la **misma región** y en la **misma app** para comunicarse por la
+red privada (service mesh). Las instancias **free están excluidas del mesh**, por eso la API usa
+una instancia `eco-small` o superior.
 
 ### Cuándo se despliega
 
-| Evento | `build` | `test` | `image` | `deploy` |
-|--------|---------|--------|---------|----------|
-| `push` a `main` | ✅ | ✅ | ✅ publica | ✅ |
-| `push` de tag `v*` | ✅ | ✅ | ✅ publica | ✅ |
-| `pull_request` a `main` | ✅ | ✅ | ⚙️ sólo construye | ❌ |
-| `workflow_dispatch` | ✅ | ✅ | ✅ publica | ✅ sólo si `deploy = true` |
+| Evento | `build` | `test` | `image` | `sqlserver-image` | `deploy` |
+|--------|---------|--------|---------|-------------------|----------|
+| `push` a `main` | ✅ | ✅ | ✅ publica | ✅ publica | ❌ |
+| `push` de tag `v*` | ✅ | ✅ | ✅ publica | ✅ publica | ❌ |
+| `pull_request` a `main` | ✅ | ✅ | ⚙️ sólo construye | ⚙️ sólo construye | ❌ |
+| `workflow_dispatch` | ✅ | ✅ | ✅ publica | ✅ publica | ✅ sólo si `deploy = true` |
 
-El job `deploy` usa un **environment** de GitHub (`production` por defecto, `staging` elegible
-desde la entrada manual), lo que permite exigir aprobación manual, restrictores de
-despliegue y secretos propios de cada entorno.
+El job `deploy` usa el **environment** de GitHub (`production` por defecto, `staging` elegible),
+lo que permite exigir aprobación manual y mantener los secretos separados por entorno. Para
+evitar crear recursos de pago (Koyeb) sin confirmación, los pushes **no despliegan**.
+
+Si más adelante se quiere desplegar automáticamente en cada push a `main`, hay que ampliar la
+condición `if` del job `deploy` en el workflow.
+
+En cada despliegue manual se actualizan la **API** y, si se pide, **SQL Server**. El servicio de
+SQL Server **no se reinicia** en un despliegue normal: su imagen sólo se actualiza en la primera
+creación o cuando se marca **`update_sqlserver = true`**. Esa actualización reinicia la base de
+datos y provoca una interrupción breve; el volumen conserva los datos.
 
 ### Secretos y variables
 
-Configurar en **Settings → Secrets and variables → Actions** (repositorio) o en el
-*environment* correspondiente:
+Configurar en **Settings → Secrets and variables → Actions → Environments → production**
+(o en el environment que se use):
 
 | Nombre | Tipo | Descripción |
 |--------|------|-------------|
-| `DEPLOY_HOST` | Variable | Dirección IP o nombre del servidor de despliegue. |
-| `DEPLOY_USER` | Variable | Usuario SSH con permisos de escritura (p. ej. `deploy`). |
-| `DEPLOY_PATH` | Variable | Ruta del despliegue en el servidor (por defecto `/opt/northwind-api`). |
-| `API_PORT` | Variable | Puerto HTTP publicado por la API (por defecto `8080`). |
-| `SQL_PORT` | Variable (opcional) | Puerto publicado por SQL Server (por defecto `1433`). |
-| `DEPLOY_URL` | Variable | URL pública de la API; se muestra como enlace del *environment*. |
-| `HEALTH_RETRIES` | Variable (opcional) | Intentos de espera (SQL Server saludable y `/health`) tras desplegar (por defecto `30`). |
-| `HEALTH_INTERVAL` | Variable (opcional) | Segundos entre intentos de verificación (por defecto `5`). |
-| `DEPLOY_SSH_KEY` | Secreto | Clave **privada** SSH del usuario de despliegue (formato OpenSSH). |
-| `DEPLOY_SSH_KNOWN_HOSTS` | Secreto | Salida de `ssh-keyscan -H <host>` (evita conexiones a hosts desconocidos). |
-| `MSSQL_SA_PASSWORD` | Secreto | Contraseña del usuario `sa` de SQL Server. |
-| `DEPLOY_GHCR_USERNAME` | Secreto (opcional) | Usuario de GHCR si el paquete es privado. |
-| `DEPLOY_GHCR_TOKEN` | Secreto (opcional) | Token de PAT de GHCR (`read:packages`) si el paquete es privado. |
+| `KOYEB_TOKEN` | Secreto | API token de Koyeb con permisos para gestionar apps, servicios, secretos y volúmenes. |
+| `MSSQL_SA_PASSWORD` | Secreto | Contraseña de `sa`; mínimo 12 caracteres, sin `;` ni comillas. Se registra también como secreto de Koyeb. |
+| `KOYEB_APP` | Variable (opcional) | Nombre de la app de Koyeb. Por defecto `northwind`. |
+| `KOYEB_REGION` | Variable (opcional) | `was` o `fra`, la misma región para volumen y servicios. Por defecto `was`. |
+| `KOYEB_SQLSERVER_SERVICE` | Variable (opcional) | Nombre del servicio SQL Server. Por defecto `sqlserver`. |
+| `KOYEB_API_SERVICE` | Variable (opcional) | Nombre del servicio de la API. Por defecto `api`. |
+| `KOYEB_VOLUME` | Variable (opcional) | Nombre del volumen persistente. Por defecto `northwind-mssql`. |
+| `KOYEB_SQLSERVER_INSTANCE` | Variable (opcional) | Tipo de instancia de SQL Server. Por defecto `medium` (2 GB). |
+| `KOYEB_API_INSTANCE` | Variable (opcional) | Tipo de instancia de la API. Por defecto `eco-small` (1 GB). |
+| `KOYEB_MSSQL_PID` | Variable (opcional) | Edición de SQL Server. Por defecto `Express`; `Developer` es válida para desarrollo/pruebas. |
+| `KOYEB_MSSQL_MEMORY_MB` | Variable (opcional) | Límite de memoria de SQL Server. Por defecto `1536`. |
+| `DEPLOY_URL` | Variable (opcional) | URL pública de la API en Koyeb; se muestra como enlace del environment. |
 
-> `GITHUB_TOKEN` se usa automáticamente para publicar la imagen en GHCR (permiso
-> `packages: write`); no hay que crear ningún secreto adicional para el registro.
+El workflow crea y actualiza automáticamente en Koyeb:
 
-> El job `deploy` valida al inicio que `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_SSH_KEY` y
-> `MSSQL_SA_PASSWORD` estén definidos; si falta alguno, falla con un mensaje que indica
-> exactamente qué configurar y en qué environment. Configura estos valores en el
-> environment que usa el despliegue (`production` por defecto).
+- la app `KOYEB_APP`;
+- el volumen `KOYEB_VOLUME` de **10 GB** en `KOYEB_REGION`;
+- el secreto `MSSQL_SA_PASSWORD` (a partir del secreto de GitHub);
+- el secreto `NORTHWIND_CONNECTION` con la cadena de conexión privada;
+- el servicio SQL Server con el volumen en `/var/opt/mssql`;
+- el servicio público de la API con health check `/health`.
 
-Ejemplo de configuración desde **GitHub CLI** (ajusta los valores):
+No hace falta configurar `DEPLOY_HOST`, `DEPLOY_USER`, claves SSH ni `DEPLOY_SSH_KNOWN_HOSTS`.
+Esos valores pertenecen al despliegue anterior por SSH y pueden eliminarse del environment.
 
-```bash
-gh variable set DEPLOY_HOST --env production --body "203.0.113.10"
-gh variable set DEPLOY_USER --env production --body "deploy"
-gh variable set DEPLOY_URL  --env production --body "http://203.0.113.10:8080"
-gh secret set DEPLOY_SSH_KEY --env production < ~/.ssh/northwind_deploy
-ssh-keyscan -H 203.0.113.10 > /tmp/northwind_known_hosts
-gh secret set DEPLOY_SSH_KNOWN_HOSTS --env production < /tmp/northwind_known_hosts
-gh secret set MSSQL_SA_PASSWORD --env production
-```
+### Requisitos y coste
 
-### Requisitos del servidor
+- Cuenta de **Koyeb con facturación**; los servicios necesarios no caben en el plan gratuito.
+- **SQL Server**: instancia estándar `medium` (2 GB) + volumen de 10 GB. Precio aproximado:
+  **21,43 USD/mes** de instancia + **5 USD/mes** de volumen (los precios pueden cambiar).
+- **API**: instancia `eco-small` (1 GB), aproximadamente **5,36 USD/mes**.
+- Coste total orientativo: **~32 USD/mes**. Se puede reducir la API a `eco-micro` (512 MB) o
+  aumentar SQL Server a `large` (4 GB) cambiando las variables.
+- El volumen persistente de Koyeb está en **public preview**: no sustituye a una base de datos
+  gestionada. No hay copias de seguridad automáticas; si se necesitan, deben programarse
+  (por ejemplo con `BACKUP DATABASE` y un almacenamiento externo).
+- SQL Server **Express** es gratuito y suficiente para Northwind, pero tiene un límite de 10 GB
+  por base de datos. Para un entorno de desarrollo se puede usar `KOYEB_MSSQL_PID=Developer`.
+- La primera creación puede tardar **10–20 minutos** por la descarga de la imagen de SQL Server.
 
-- Linux con **Docker Engine** y el plugin **Compose v2** (`docker compose version`).
-- Un usuario SSH con permisos de escritura sobre `DEPLOY_PATH` y con acceso a Docker
-  (grupo `docker`).
-- `curl` o `wget` instalado (si no, el sondeo de salud se hace con un contenedor efímero
-  `curlimages/curl`).
-- Salida a Internet para descargar la imagen de GHCR.
+### Puesta en marcha
 
-### Pasos para desplegar
-
-**A. Preparación del servidor (una sola vez)**
-
-1. Crear el usuario de despliegue y autorizar la clave pública:
-
-   ```bash
-   sudo adduser --disabled-password --gecos "" deploy
-   sudo usermod -aG docker deploy          # acceso al socket de Docker
-   sudo install -d -o deploy -g deploy /opt/northwind-api
-   sudo -u deploy mkdir -p ~/.ssh
-   sudo -u deploy bash -c 'cat >> ~/.ssh/authorized_keys' <<< "CLAVE_PUBLICA"
-   sudo chmod 700 ~/.ssh && sudo chmod 600 ~/.ssh/authorized_keys
-   ```
-
-2. Generar el par de claves (en el equipo, no en el servidor) y registrar la **privada**
-   como secreto `DEPLOY_SSH_KEY`:
+1. Crear un **API token** en Koyeb (**Account → API tokens**) y guardarlo como secreto
+   `KOYEB_TOKEN` en el environment `production` de GitHub.
+2. Crear el secreto `MSSQL_SA_PASSWORD` con una contraseña fuerte (mínimo 12 caracteres, sin
+   `;` ni comillas). No se debe pegar en el chat ni en el repositorio.
+3. Opcionalmente, definir las variables `KOYEB_APP`, `KOYEB_REGION`, etc. con los valores
+   deseados. Los valores por defecto ya crean una arquitectura funcional.
+4. Ejecutar **Actions → CI/CD Pipeline → Run workflow**, marcar `deploy = true` y elegir
+   `production`. Un `push` a `main` sólo publica las imágenes; no despliega.
+5. El primer despliegue crea la app, el volumen, los secretos y los dos servicios; después
+   ejecuta `init-northwind.sh` dentro del contenedor de SQL Server. La API se crea al final,
+   cuando la base ya está disponible.
+6. Copiar la URL pública de la API desde el panel de Koyeb y asignarla a la variable
+   `DEPLOY_URL` del environment. Verificar:
 
    ```bash
-   ssh-keygen -t ed25519 -C "northwind-deploy" -f ~/.ssh/northwind_deploy
-   ssh-keyscan -H <servidor>        # -> contenido del secreto DEPLOY_SSH_KNOWN_HOSTS
-   ```
-
-3. Registrar en GitHub los secretos y variables de la tabla anterior.
-
-4. Publicar el paquete de GHCR como público, o bien crear
-   `DEPLOY_GHCR_USERNAME` / `DEPLOY_GHCR_TOKEN` para que el servidor se autentique.
-
-**B. Lanzar el primer despliegue**
-
-1. En **Actions → CI/CD Pipeline → Run workflow**, marcar **`deploy = true`** y elegir el
-   entorno (`production`).
-2. El pipeline ejecuta `build → test → image → deploy`.
-3. En el servidor, `deploy/deploy.sh` comprueba si la base `Northwind` existe: si no,
-   ejecuta `db-init` una sola vez (perfil `init`) y carga `instnwnd.sql`.
-4. Verificación final:
-
-   ```bash
-   curl -fsS http://<servidor>:8080/health
+   curl -fsS https://<url-de-koyeb>/health
    # {"status":"Healthy","database":"Northwind"}
    ```
 
-**C. Despliegues posteriores**
+### Actualizaciones y mantenimiento
 
-Cada `push` a `main` (o cada tag `v*`) vuelve a ejecutar el pipeline completo y actualiza
-el servidor con la imagen recién publicada. El flujo en el servidor es siempre el mismo:
+- **API**: cada push a `main` publica una imagen nueva; el servicio se actualiza en el
+  siguiente despliegue manual con `deploy = true`.
+- **SQL Server**: la imagen se actualiza sólo con `update_sqlserver = true` en
+  `workflow_dispatch`. El volumen se conserva, pero el servicio se reinicia.
+- **Contraseña de `sa`**: no cambiar `MSSQL_SA_PASSWORD` después del primer arranque sin
+  cambiar también la contraseña dentro de SQL Server (`ALTER LOGIN sa WITH PASSWORD = ...`).
+  El secreto de Koyeb y la cadena de conexión se actualizan en cada ejecución, pero la
+  contraseña almacenada en la base no cambia sola.
+- **Datos**: el volumen `northwind-mssql` persiste entre despliegues. Si se elimina el
+  **volumen**, se pierden los datos y la siguiente ejecución vuelve a cargar `instnwnd.sql`.
+  Eliminar sólo el servicio no borra el volumen.
+- **Volver a una imagen anterior**: ejecutar el workflow con el commit anterior o cambiar el
+  tag de la imagen en el panel de Koyeb. El servicio SQL Server no cambia si no se pide
+  `update_sqlserver`.
+- **Reiniciar la base desde cero**: eliminar el servicio y el volumen en Koyeb y volver a
+  ejecutar el workflow. Es una operación destructiva.
 
-```
-ssh → docker login (si es privado) → docker compose pull api
-     → docker compose up -d sqlserver  → espera "healthy"
-     → db-init (sólo si la BD está vacía)
-     → docker compose up -d api        → /health  →  ok  |  reversión
-```
+### Despliegue SSH anterior
 
-**D. Verificación y reversión manual**
+Los archivos [`deploy/docker-compose.prod.yml`](deploy/docker-compose.prod.yml) y
+[`deploy/deploy.sh`](deploy/deploy.sh) se conservan como referencia para un VPS, pero el
+pipeline ya **no los usa**. El despliegue soportado es Koyeb.
 
-```bash
-# Estado de los contenedores
-cd /opt/northwind-api && docker compose -f docker-compose.prod.yml ps
-
-# Última imagen desplegada
-cat /opt/northwind-api/last-image
-
-# Volver a una versión anterior
-export API_IMAGE=ghcr.io/webtechnologiesucb/app02:<etiqueta-anterior>
-export MSSQL_SA_PASSWORD='...'
-docker compose -f docker-compose.prod.yml up -d api
-```
-
-### Ejecución local equivalente (sin pipeline)
-
-```bash
-dotnet restore NorthwindApi.slnx
-dotnet build NorthwindApi.slnx --configuration Release
-bash scripts/init-northwind.sh          # requiere Docker + SQL Server accesible
-dotnet test NorthwindApi.slnx --configuration Release
-docker build -t ghcr.io/webtechnologiesucb/app02:local .
-```
-
-El script `scripts/init-northwind.sh` es reutilizable en local: crea la base (si no existe) y
-carga `instnwnd.sql` ejecutando `sqlcmd` dentro de un contenedor efímero de SQL Server.
 
 ---
 
@@ -583,10 +580,10 @@ docker compose down -v            # detener y borrar los datos
   `docker compose run --rm db-init` (tras `docker compose down`).
 
 > Este `docker-compose.yml` es el de **desarrollo**: construye la imagen localmente
-> (`--build`). El despliegue a un servidor lo hace el pipeline de GitHub Actions con
-> [`deploy/docker-compose.prod.yml`](deploy/docker-compose.prod.yml), que **consume la imagen
-> ya publicada en GHCR** en lugar de construirla. Véase
-> [Pipeline CI/CD (GitHub Actions)](#pipeline-cicd-github-actions).
+> (`--build`). El despliegue real lo hace el pipeline de GitHub Actions en **Koyeb**, usando
+> las imágenes publicadas en GHCR. `deploy/docker-compose.prod.yml` y `deploy/deploy.sh`
+> quedan como referencia legacy para un VPS. Véase
+> [Pipeline CI/CD (GitHub Actions + Koyeb)](#pipeline-cicd-github-actions--koyeb).
 
 ---
 
